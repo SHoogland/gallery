@@ -28,7 +28,7 @@ env:
   # Patches applied on top of the upstream tag, in order.
   # They must be reachable from shoogland/gallery or shoogland-bot/gallery.
   PATCH_COMMITS: |
-    df01d576a76fc73ee290023fa74e1950587319db
+    a091a1cd8a67464ca0c4595296a28b10f89d166c
 
 jobs:
   build:
