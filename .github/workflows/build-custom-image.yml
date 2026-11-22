@@ -1,0 +1,147 @@
+name: Build custom gallery-server
+
+# Place at: .github/workflows/build-custom.yml in shoogland/gallery
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream tag to build (empty = latest upstream release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the image tag already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-custom
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: open-noodle/gallery
+  IMAGE_REPO: ghcr.io/shoogland/gallery-server
+  # Patches applied on top of the upstream tag, in order.
+  # They must be reachable from shoogland/gallery or shoogland-bot/gallery.
+  PATCH_COMMITS: |
+    df01d576a76fc73ee290023fa74e1950587319db
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve target version
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            # latest non-draft, non-prerelease upstream release
+            VERSION=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Target upstream version: $VERSION"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: shoogland
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Check if image already exists
+        id: exists
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if docker buildx imagetools inspect "${IMAGE_REPO}:${VERSION}-custom" >/dev/null 2>&1; then
+            echo "Image ${IMAGE_REPO}:${VERSION}-custom already exists, nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare patched source
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "gallery-build-bot"
+          git config user.email "gallery-build-bot@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git remote add bot https://github.com/shoogland-bot/gallery.git
+          git fetch upstream --tags --force
+          git fetch bot || echo "bot remote not fetchable, continuing"
+
+          git checkout -b "my-custom-${VERSION}" "refs/tags/${VERSION}"
+
+          for sha in $PATCH_COMMITS; do
+            echo "Cherry-picking $sha"
+            git cherry-pick "$sha"
+          done
+
+          FORK_VERSION="$VERSION" ./branding/scripts/apply-branding.sh
+          ./branding/scripts/verify-branding.sh
+
+      - name: Compute tags
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          CUSTOM_TAG="${VERSION}-custom.$(date -u +%Y%m%d%H%M).$(git rev-parse --short HEAD)"
+          echo "CUSTOM_TAG=$CUSTOM_TAG" >> "$GITHUB_ENV"
+          echo "BUILD_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Set up Buildx
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GHCR_PAT }}
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64
+          push: true
+          secrets: |
+            github_token=${{ secrets.GHCR_PAT }}
+          build-args: |
+            BUILD_SOURCE_REF=${{ env.CUSTOM_TAG }}
+            BUILD_SOURCE_COMMIT=${{ env.BUILD_COMMIT }}
+          tags: |
+            ${{ env.IMAGE_REPO }}:${{ env.CUSTOM_TAG }}
+            ${{ env.IMAGE_REPO }}:${{ env.VERSION }}-custom
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Custom gallery build"
+            echo "- Upstream version: \`${VERSION}\`"
+            if [ "${{ steps.exists.outputs.skip }}" = "true" ]; then
+              echo "- Result: already built, skipped"
+            else
+              echo "- Image: \`${IMAGE_REPO}:${CUSTOM_TAG:-n/a}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
