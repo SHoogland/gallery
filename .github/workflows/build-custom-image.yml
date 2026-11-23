@@ -78,6 +78,13 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install ImageMagick (needed by apply-branding.sh)
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends imagemagick
+
       - name: Prepare patched source
         if: steps.exists.outputs.skip != 'true'
         run: |
